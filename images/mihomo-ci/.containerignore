@@ -1,0 +1,4 @@
+# Allowlist only public build inputs. Supply provision.sh, geodata.json, and lock metadata via --build-context.
+*
+**
+!Containerfile

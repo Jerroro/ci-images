@@ -1,0 +1,11 @@
+# Allowlist only public build inputs; new files stay excluded by default.
+*
+**
+!Containerfile
+!sshd_config
+!scripts/
+scripts/**
+!scripts/entrypoint.sh
+!scripts/smoke.sh
+!scripts/versions.py
+!scripts/configure-environment.py

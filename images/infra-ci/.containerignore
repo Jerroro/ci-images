@@ -1,0 +1,4 @@
+# Allowlist only public build inputs. Supply provision.sh and flake.lock via --build-context.
+*
+**
+!Containerfile

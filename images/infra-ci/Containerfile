@@ -1,0 +1,154 @@
+FROM ghcr.io/actions/actions-runner:2.338.2@sha256:4037925f16bd0626196684aff1853dabd242675c82efe08f0a2d376694738d19
+
+ARG APT_MIRROR=""
+ARG NIX_SUBSTITUTERS="https://cache.nixos.org"
+USER root
+COPY --from=setup provision.sh /usr/local/libexec/infra-ci/provision.sh
+COPY --from=lock flake.lock /usr/local/share/infra-ci/flake.lock
+RUN set -eu; \
+    chown -R root:root /usr/local/libexec/infra-ci /usr/local/share/infra-ci; \
+    chmod 0755 /usr/local/libexec/infra-ci/provision.sh; \
+    chmod 0644 /usr/local/share/infra-ci/flake.lock; \
+    apt_backup=""; \
+    if [ -n "$APT_MIRROR" ]; then \
+      case "$APT_MIRROR" in \
+        https://*) ;; \
+        *) echo "ERROR: APT_MIRROR must use https://" >&2; exit 1 ;; \
+      esac; \
+      case "$APT_MIRROR" in \
+        *[[:space:]\"\'\\\#]*) echo "ERROR: invalid character in APT_MIRROR" >&2; exit 1 ;; \
+      esac; \
+      apt_backup="$(mktemp -d)"; \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
+        if [ -f "$f" ]; then \
+          cp -a "$f" "$apt_backup/$(basename "$f")"; \
+          sed -i -E "s#https?://(archive|security)\\.ubuntu\\.com/ubuntu#${APT_MIRROR}#g" "$f"; \
+        fi; \
+      done; \
+    fi; \
+    CLEAN_APT_LISTS=1 /usr/local/libexec/infra-ci/provision.sh; \
+    if [ -n "$apt_backup" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
+        if [ -f "$apt_backup/$(basename "$f")" ]; then \
+          mv -f "$apt_backup/$(basename "$f")" "$f"; \
+        fi; \
+      done; \
+      rm -rf "$apt_backup"; \
+    fi; \
+    /usr/local/libexec/infra-ci/provision.sh --verify-only; \
+    install -d -m 0755 -o runner -g runner /nix; \
+    install -d -m 0755 /etc/nix; \
+    printf '%s\n' \
+      'show-trace = true' \
+      'experimental-features = nix-command flakes' \
+      'sandbox = false' \
+      'filter-syscalls = false' \
+      'build-users-group =' \
+      "substituters = ${NIX_SUBSTITUTERS}" \
+      > /etc/nix/nix.conf; \
+    chmod 0644 /etc/nix/nix.conf
+
+# Pre-bake single-user Nix 2.36.0 + public flake.lock upstream closure owned by runner (1001:1001).
+# No checkout, GitHub token, host store, or private repository files belong in this image.
+USER runner
+ENV PATH="/nix/var/nix/profiles/infra-ci/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    NIX_SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt" \
+    SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
+
+RUN set -eu; \
+    NIX_VERSION="2.36.0"; \
+    case "$(uname -s).$(uname -m)" in \
+      Linux.x86_64) \
+        nix_system="x86_64-linux"; \
+        nix_sha256="c4d1aed088f62aa729823cffa3269e880de6ce6102fecb8909f2821eedb2f2eb" ;; \
+      Linux.aarch64) \
+        nix_system="aarch64-linux"; \
+        nix_sha256="ee696971de946d311699f6dd639cccc8c6734aec9a061b8e205de0ce6515e5ae" ;; \
+      *) \
+        echo "Unsupported platform: $(uname -s).$(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    tmp_dir="$(mktemp -d)"; \
+    trap 'rm -rf "$tmp_dir"' EXIT; \
+    tarball="$tmp_dir/nix-${NIX_VERSION}-${nix_system}.tar.xz"; \
+    curl --retry 5 --retry-all-errors -fsSL \
+      "https://releases.nixos.org/nix/nix-${NIX_VERSION}/nix-${NIX_VERSION}-${nix_system}.tar.xz" \
+      -o "$tarball"; \
+    printf '%s  %s\n' "$nix_sha256" "$tarball" | sha256sum -c -; \
+    mkdir -p "$tmp_dir/unpack"; \
+    tar -xJf "$tarball" -C "$tmp_dir/unpack"; \
+    install_script="$(ls "$tmp_dir"/unpack/nix-*/install | head -n 1)"; \
+    USER="runner" NIX_INSTALLER_NO_MODIFY_PROFILE=1 INVOKED_FROM_INSTALL_IN=1 "$install_script" --no-daemon; \
+    profile_link=""; \
+    if [ -e "$HOME/.nix-profile" ]; then \
+      profile_link="$HOME/.nix-profile"; \
+    elif [ -e "$HOME/.local/state/nix/profiles/profile" ]; then \
+      profile_link="$HOME/.local/state/nix/profiles/profile"; \
+    fi; \
+    test -n "$profile_link"; \
+    target_profile="$(readlink -f "$profile_link")"; \
+    mkdir -p /nix/var/nix/profiles /nix/var/nix/gcroots; \
+    ln -sfn "$target_profile" /nix/var/nix/profiles/infra-ci; \
+    /nix/var/nix/profiles/infra-ci/bin/nix --version; \
+    seed_dir="$tmp_dir/seed-flake"; \
+    mkdir -p "$seed_dir"; \
+    cp /usr/local/share/infra-ci/flake.lock "$seed_dir/flake.lock"; \
+    printf '%s\n' \
+      '{' \
+      '  inputs = {' \
+      '    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";' \
+      '    clan-core = {' \
+      '      url = "https://git.clan.lol/clan/clan-core/archive/26.05.tar.gz";' \
+      '      inputs.nixpkgs.follows = "nixpkgs";' \
+      '    };' \
+      '    sops-nix = {' \
+      '      url = "github:Mic92/sops-nix";' \
+      '      inputs.nixpkgs.follows = "nixpkgs";' \
+      '    };' \
+      '  };' \
+      '  outputs = { self, nixpkgs, clan-core, sops-nix }:' \
+      '    let' \
+      '      mkSeed = system:' \
+      '        let' \
+      '          pkgs = import nixpkgs { inherit system; };' \
+      '          testPython = pkgs.python314.withPackages (p: [ p.pytest p.pyyaml ]);' \
+      '        in pkgs.writeText "infra-ci-seed" (pkgs.lib.concatStringsSep "\n" [' \
+      '          "${nixpkgs}"' \
+      '          "${clan-core}"' \
+      '          "${sops-nix}"' \
+      '          "${clan-core.inputs.data-mesher}"' \
+      '          "${clan-core.inputs.disko}"' \
+      '          "${clan-core.inputs.flake-parts}"' \
+      '          "${clan-core.inputs.nix-darwin}"' \
+      '          "${clan-core.inputs.nix-select}"' \
+      '          "${clan-core.inputs.systems}"' \
+      '          "${clan-core.inputs.treefmt-nix}"' \
+      '          "${testPython}"' \
+      '          "${pkgs.openssh}"' \
+      '          "${pkgs.systemd}"' \
+      '          "${pkgs.restic}"' \
+      '          "${pkgs.jq}"' \
+      '          "${pkgs.cpio}"' \
+      '          "${pkgs.gzip}"' \
+      '          "${pkgs.nftables}"' \
+      '          "${pkgs.python3}"' \
+      '          "${pkgs.bash}"' \
+      '          "${pkgs.bashInteractive}"' \
+      '          "${pkgs.coreutils}"' \
+      '          "${pkgs.gnugrep}"' \
+      '          "${pkgs.gnused}"' \
+      '          "${pkgs.gawk}"' \
+      '          "${pkgs.findutils}"' \
+      '          "${pkgs.gnutar}"' \
+      '          "${pkgs.stdenvNoCC}"' \
+      '        ]);' \
+      '    in {' \
+      '      packages.x86_64-linux.seed = mkSeed "x86_64-linux";' \
+      '      packages.aarch64-linux.seed = mkSeed "aarch64-linux";' \
+      '    };' \
+      '}' \
+      > "$seed_dir/flake.nix"; \
+    /nix/var/nix/profiles/infra-ci/bin/nix build --no-write-lock-file \
+      --out-link /nix/var/nix/gcroots/infra-ci-seed \
+      "path:${seed_dir}#seed"; \
+    python3 -c 'import sqlite3; c = sqlite3.connect("/nix/var/nix/db/db.sqlite"); row = c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone(); assert row and row[0] == 0 and row[2] == row[1], row; mode = c.execute("PRAGMA journal_mode=DELETE").fetchone(); assert mode and mode[0].lower() == "delete", mode; c.close()'; \
+    rm -rf "$HOME/.cache/nix"

@@ -1,0 +1,111 @@
+FROM ghcr.io/actions/actions-runner:2.338.2@sha256:4037925f16bd0626196684aff1853dabd242675c82efe08f0a2d376694738d19 AS provisioned
+
+USER root
+COPY --from=setup provision.sh /usr/local/libexec/mihomo-ci/provision.sh
+COPY --from=geodata geodata.json /usr/local/share/mihomo-ci/geodata.json
+RUN chown -R root:root /usr/local/libexec/mihomo-ci /usr/local/share/mihomo-ci \
+    && chmod 0755 /usr/local/libexec/mihomo-ci/provision.sh \
+    && chmod 0644 /usr/local/share/mihomo-ci/geodata.json \
+    && CLEAN_APT_LISTS=1 GEODATA_MANIFEST=/usr/local/share/mihomo-ci/geodata.json \
+       /usr/local/libexec/mihomo-ci/provision.sh \
+    && rm -rf /root/.cache
+
+# Pre-bake SHA-256-verified locked Python wheels and a ready offline venv from narrow
+# lock metadata (pyproject.toml, uv.lock, .python-version) without leaking build inputs
+# or caches into the final runner image. Avoid Dockerfile heredocs for Buildah 1.33 parity.
+FROM provisioned AS wheelhouse-builder
+COPY --from=lock pyproject.toml uv.lock .python-version /tmp/mihomo-lock/
+RUN set -eu; printf '%s\n' \
+    'import hashlib, os, pathlib, subprocess, time, tomllib, urllib.parse, urllib.request' \
+    'lock_dir = pathlib.Path("/tmp/mihomo-lock")' \
+    'lock_path = lock_dir / "uv.lock"' \
+    'wheelhouse = pathlib.Path("/usr/local/share/mihomo-ci/wheelhouse")' \
+    'wheelhouse.mkdir(parents=True, exist_ok=True)' \
+    'lock_bytes = lock_path.read_bytes()' \
+    'pathlib.Path("/usr/local/share/mihomo-ci/uv.lock.sha256").write_text(f"{hashlib.sha256(lock_bytes).hexdigest()}\n", encoding="utf-8")' \
+    'lock = tomllib.loads(lock_bytes.decode("utf-8"))' \
+    'def is_linux_x86_64_cp314_wheel(url: str) -> bool:' \
+    '    name = urllib.parse.unquote(pathlib.Path(urllib.parse.urlsplit(url).path).name)' \
+    '    if not name.endswith(".whl"):' \
+    '        return False' \
+    '    parts = name[:-4].split("-")' \
+    '    if len(parts) < 5:' \
+    '        return False' \
+    '    py_tags, abi_tags, plat_tags = parts[-3].split("."), parts[-2].split("."), parts[-1].split(".")' \
+    '    py_ok = any(tag in ("py3", "cp3", "cp314") for tag in py_tags)' \
+    '    abi_ok = any(tag in ("none", "abi3", "cp314") for tag in abi_tags)' \
+    '    plat_ok = any(p == "any" or p == "linux_x86_64" or ("manylinux" in p and p.endswith("x86_64")) for p in plat_tags)' \
+    '    return py_ok and abi_ok and plat_ok' \
+    'def fetch_verified(url: str, expected_hash: str) -> bytes:' \
+    '    if not url.startswith("https://"):' \
+    '        raise SystemExit(f"Refusing non-HTTPS artifact URL: {url}")' \
+    '    if not expected_hash.startswith("sha256:"):' \
+    '        raise SystemExit(f"Expected sha256 hash, got: {expected_hash}")' \
+    '    expected_hex = expected_hash.split(":", 1)[1]' \
+    '    if len(expected_hex) != 64:' \
+    '        raise SystemExit(f"Invalid sha256 digest length for {url}")' \
+    '    last_err = None' \
+    '    for attempt in range(4):' \
+    '        try:' \
+    '            with urllib.request.urlopen(url, timeout=90) as resp:' \
+    '                data = resp.read(64 * 1024 * 1024 + 1)' \
+    '            if len(data) > 64 * 1024 * 1024:' \
+    '                raise SystemExit(f"Artifact exceeds 64 MiB ceiling: {url}")' \
+    '            actual_hex = hashlib.sha256(data).hexdigest()' \
+    '            if actual_hex != expected_hex:' \
+    '                raise SystemExit(f"SHA-256 mismatch for {url}: {actual_hex} != {expected_hex}")' \
+    '            return data' \
+    '        except SystemExit:' \
+    '            raise' \
+    '        except Exception as exc:' \
+    '            last_err = exc' \
+    '            if attempt < 3:' \
+    '                time.sleep(2 * (attempt + 1))' \
+    '    raise RuntimeError(f"Failed to download {url}") from last_err' \
+    'downloaded = 0' \
+    'for pkg in lock.get("package", []):' \
+    '    source = pkg.get("source", {})' \
+    '    if source.get("editable") is not None or source.get("virtual") is not None:' \
+    '        continue' \
+    '    selected = next((w for w in pkg.get("wheels", []) if is_linux_x86_64_cp314_wheel(w["url"])), None)' \
+    '    if selected is None and not pkg.get("wheels") and "sdist" in pkg:' \
+    '        selected = pkg["sdist"]' \
+    '    if selected is None:' \
+    '        continue' \
+    '    url = selected["url"]' \
+    '    name = urllib.parse.unquote(pathlib.Path(urllib.parse.urlsplit(url).path).name)' \
+    '    if pathlib.Path(name).name != name or name in ("", ".", ".."):' \
+    '        raise SystemExit(f"Invalid wheel filename: {name}")' \
+    '    (wheelhouse / name).write_bytes(fetch_verified(url, selected["hash"]))' \
+    '    downloaded += 1' \
+    'if downloaded <= 0:' \
+    '    raise SystemExit("Wheelhouse download produced zero artifacts")' \
+    'offline_env = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "all_proxy", "no_proxy", "ftp_proxy")}' \
+    'offline_env.update({"UV_PYTHON_INSTALL_DIR": "/usr/local/share/uv/python", "UV_PYTHON_DOWNLOADS": "never", "UV_CACHE_DIR": "/tmp/uv-wheelhouse-cache", "UV_LINK_MODE": "copy", "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt"})' \
+    'req_path = pathlib.Path("/tmp/mihomo-requirements.txt")' \
+    'exported = subprocess.run(["/usr/local/bin/uv", "export", "--offline", "--locked", "--no-emit-project", "--no-annotate"], cwd=lock_dir, env=offline_env, capture_output=True, text=True, check=True)' \
+    'req_path.write_text(exported.stdout, encoding="utf-8")' \
+    'venv_dir = pathlib.Path("/opt/mihomo-config/.venv")' \
+    'venv_dir.parent.mkdir(parents=True, exist_ok=True)' \
+    'subprocess.run(["/usr/local/bin/uv", "venv", "--python", "/usr/local/bin/python3.14", str(venv_dir)], cwd=lock_dir, env=offline_env, check=True)' \
+    'subprocess.run(["/usr/local/bin/uv", "pip", "sync", "--python", str(venv_dir / "bin/python"), "--offline", "--no-index", "--find-links", str(wheelhouse), "--require-hashes", str(req_path)], cwd=lock_dir, env=offline_env, check=True)' \
+    | SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt /usr/local/bin/python3.14 - \
+    && chown -R root:root /usr/local/share/mihomo-ci /opt/mihomo-config \
+    && chmod -R a+rX /usr/local/share/mihomo-ci /opt/mihomo-config \
+    && rm -rf /tmp/mihomo-requirements.txt /tmp/uv-wheelhouse-cache /root/.cache
+
+FROM provisioned
+COPY --from=wheelhouse-builder /usr/local/share/mihomo-ci /usr/local/share/mihomo-ci
+COPY --from=wheelhouse-builder /opt/mihomo-config/.venv /opt/mihomo-config/.venv
+
+ENV MIHOMO_CONFIG_VALIDATOR=/usr/local/bin/mihomo \
+    MIHOMO_SOPS_BIN=/usr/local/bin/sops \
+    MIHOMO_CONFIG_DATA_DIR=/usr/share/mihomo-config/geodata \
+    UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python \
+    UV_PYTHON_DOWNLOADS=never \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+# Pre-bakes uv, Python 3.14, mihomo, sops, apt tools, SHA-256-verified Country.mmdb,
+# locked Python wheelhouse, and offline virtualenv from public lock metadata.
+# No checkout, GitHub token, private subscription data, or runtime secrets belong here.
+USER runner

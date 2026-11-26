@@ -1,0 +1,9 @@
+{
+  "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/f57214884b79e6e6770d753950b81242dd7f2541/country.mmdb",
+  "sha256": "ccec4d6fa69de3a79960a460c377ac9a23c1a90e5f9052dae3488921e56201df",
+  "upstream": "https://github.com/MetaCubeX/meta-rules-dat",
+  "file": "Country.mmdb",
+  "data_license": "https://creativecommons.org/licenses/by-sa/4.0/",
+  "attribution": "Compiled by MetaCubeX/meta-rules-dat from Loyalsoldier/geoip. This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com.",
+  "modifications": "Country.mmdb is an unmodified copy of the pinned upstream country.mmdb."
+}

@@ -1,0 +1,448 @@
+name: Build and publish container images
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  repository_dispatch:
+    types:
+      - sync-locks
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Image target to build (all, infra-ci, mihomo-ci, or agent-dev)
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - infra-ci
+          - mihomo-ci
+          - agent-dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      build_infra_ci: ${{ steps.targets.outputs.build_infra_ci }}
+      build_mihomo_ci: ${{ steps.targets.outputs.build_mihomo_ci }}
+      build_agent_dev: ${{ steps.targets.outputs.build_agent_dev }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run repository contract tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Resolve affected image build targets
+        id: targets
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TARGET: ${{ inputs.target || 'all' }}
+          REPO_DISPATCH_TARGET: ${{ github.event.client_payload.target || 'all' }}
+          BEFORE_SHA: ${{ github.event.before || '' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          event = os.environ["EVENT_NAME"]
+          build_infra = False
+          build_mihomo = False
+          build_agent = False
+
+          def apply_target(target: str) -> tuple[bool, bool, bool]:
+              if target == "all":
+                  return True, True, True
+              if target == "infra-ci":
+                  return True, False, False
+              if target == "mihomo-ci":
+                  return False, True, False
+              if target == "agent-dev":
+                  return False, False, True
+              raise SystemExit(f"ERROR: unsupported build target: {target!r}")
+
+          def commit_exists(sha: str) -> bool:
+              if not sha or set(sha) == {"0"}:
+                  return False
+              return (
+                  subprocess.run(
+                      ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                  ).returncode
+                  == 0
+              )
+
+          if event == "workflow_dispatch":
+              build_infra, build_mihomo, build_agent = apply_target(os.environ["DISPATCH_TARGET"])
+          elif event == "repository_dispatch":
+              build_infra, build_mihomo, build_agent = apply_target(os.environ["REPO_DISPATCH_TARGET"])
+          else:
+              base_sha = os.environ["BASE_SHA"] if event == "pull_request" else os.environ["BEFORE_SHA"]
+              head_sha = os.environ["HEAD_SHA"]
+              if not (commit_exists(base_sha) and commit_exists(head_sha)):
+                  changed = ["__ALL__"]
+              else:
+                  left_sha = base_sha
+                  if event == "pull_request":
+                      mb = subprocess.run(
+                          ["git", "merge-base", base_sha, head_sha],
+                          capture_output=True,
+                          text=True,
+                      )
+                      if mb.returncode != 0 or not mb.stdout.strip():
+                          changed = ["__ALL__"]
+                          left_sha = ""
+                      else:
+                          left_sha = mb.stdout.strip()
+                  if left_sha:
+                      diff = subprocess.run(
+                          ["git", "diff", "--no-renames", "--name-only", "-z", left_sha, head_sha],
+                          check=True,
+                          capture_output=True,
+                          text=True,
+                      )
+                      changed = [entry for entry in diff.stdout.split("\0") if entry]
+
+              if "__ALL__" in changed or ".github/workflows/build.yml" in changed:
+                  build_infra = build_mihomo = build_agent = True
+              else:
+                  for path in changed:
+                      if path.startswith(("images/infra-ci/", "locks/infra/")):
+                          build_infra = True
+                      elif path.startswith(("images/mihomo-ci/", "locks/mihomo/")):
+                          build_mihomo = True
+                      elif path.startswith("images/agent-dev/"):
+                          build_agent = True
+
+          outputs = {
+              "build_infra_ci": "true" if build_infra else "false",
+              "build_mihomo_ci": "true" if build_mihomo else "false",
+              "build_agent_dev": "true" if build_agent else "false",
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fp:
+              for key, value in outputs.items():
+                  fp.write(f"{key}={value}\n")
+                  print(f"{key}={value}")
+          PY
+
+  infra-ci:
+    needs: [contracts]
+    if: needs.contracts.outputs.build_infra_ci == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Ensure Podman is available
+        run: |
+          set -euo pipefail
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo -n apt-get update
+            sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              podman uidmap slirp4netns fuse-overlayfs
+          fi
+          sudo -n podman info --format 'Podman {{.Version.Version}} storage={{.Store.GraphDriverName}}'
+
+      - name: Build and offline-smoke-test infra-ci
+        run: |
+          set -euo pipefail
+          pkg="infra-ci"
+          image="ghcr.io/jerroro/${pkg}"
+          ctx_tmp="$(mktemp -d)"
+          trap 'rm -rf "$ctx_tmp"' EXIT
+          mkdir -p "${ctx_tmp}/setup" "${ctx_tmp}/lock"
+          cp images/infra-ci/provision.sh "${ctx_tmp}/setup/provision.sh"
+          cp locks/infra/flake.lock "${ctx_tmp}/lock/flake.lock"
+
+          sudo -n podman build \
+            --pull=always \
+            --no-cache \
+            --build-context "setup=${ctx_tmp}/setup" \
+            --build-context "lock=${ctx_tmp}/lock" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=https://github.com/Jerroro/ci-images" \
+            -t "${image}:sha-${GITHUB_SHA}" \
+            images/infra-ci
+
+          iid="$(sudo -n podman image inspect "${image}:sha-${GITHUB_SHA}" --format '{{.Id}}')"
+          [[ "$iid" == sha256:* ]] || iid="sha256:${iid}"
+
+          sudo -n podman run --rm --pull=never --network=none --read-only --cgroups=disabled \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777 \
+            -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e XDG_STATE_HOME=/tmp/.local/state \
+            --entrypoint /bin/bash "$iid" -euo pipefail -c '
+              test "$(id -u)" -eq 1001
+              test -x /home/runner/run.sh
+              /usr/local/libexec/infra-ci/provision.sh --verify-only
+              /usr/local/libexec/infra-ci/provision.sh
+              test -x /nix/var/nix/profiles/infra-ci/bin/nix
+              test -L /nix/var/nix/gcroots/infra-ci-seed
+              nix --version
+              test "$(nix --offline --extra-experimental-features read-only-local-store --store "local?read-only=true" eval --expr "1 + 1")" = "2"
+              seed_path="$(readlink -f /nix/var/nix/gcroots/infra-ci-seed)"
+              nix --offline --extra-experimental-features read-only-local-store --store "local?read-only=true" path-info --recursive "$seed_path" >/dev/null
+              while IFS= read -r p || [[ -n "$p" ]]; do
+                test -n "$p" && test -e "$p"
+              done < "$seed_path"
+            '
+
+      - name: Push infra-ci to GHCR
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pkg="infra-ci"
+          image="ghcr.io/jerroro/${pkg}"
+          settings_url="https://github.com/users/Jerroro/packages/container/${pkg}/settings"
+          work_dir="$(mktemp -d)"
+          chmod 0700 "$work_dir"
+          trap 'sudo -n rm -rf "$work_dir"' EXIT
+          digest_file="${work_dir}/digest"
+
+          printf '%s' "$GH_TOKEN" | sudo -n podman login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          sudo -n podman push --digestfile "$digest_file" "${image}:sha-${GITHUB_SHA}"
+
+          manifest_digest="$(sudo -n cat "$digest_file" | tr -d '[:space:]')"
+          if [[ ! "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "ERROR: Unexpected pushed manifest digest: ${manifest_digest}" >&2
+            exit 1
+          fi
+
+          main_head="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [[ ! "$main_head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: Failed to resolve remote refs/heads/main SHA: ${main_head}" >&2
+            exit 1
+          fi
+          if [[ "$main_head" == "$GITHUB_SHA" ]]; then
+            sudo -n podman tag "${image}:sha-${GITHUB_SHA}" "${image}:latest"
+            sudo -n podman push "${image}:latest"
+          fi
+
+          echo "PUBLISHED_DIGEST=${image}@${manifest_digest}"
+          {
+            echo "### Published \`${image}\`"
+            echo "- Revision: \`${GITHUB_SHA}\`"
+            echo "- Immutable digest: \`${image}@${manifest_digest}\`"
+            echo "- Package settings: ${settings_url}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  mihomo-ci:
+    needs: [contracts]
+    if: needs.contracts.outputs.build_mihomo_ci == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Ensure Podman is available
+        run: |
+          set -euo pipefail
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo -n apt-get update
+            sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              podman uidmap slirp4netns fuse-overlayfs
+          fi
+          sudo -n podman info --format 'Podman {{.Version.Version}} storage={{.Store.GraphDriverName}}'
+
+      - name: Build and offline-smoke-test mihomo-ci
+        run: |
+          set -euo pipefail
+          pkg="mihomo-ci"
+          image="ghcr.io/jerroro/${pkg}"
+          ctx_tmp="$(mktemp -d)"
+          trap 'rm -rf "$ctx_tmp"' EXIT
+          mkdir -p "${ctx_tmp}/setup" "${ctx_tmp}/geodata" "${ctx_tmp}/lock"
+          cp images/mihomo-ci/provision.sh "${ctx_tmp}/setup/provision.sh"
+          cp locks/mihomo/geodata.json "${ctx_tmp}/geodata/geodata.json"
+          cp locks/mihomo/pyproject.toml locks/mihomo/uv.lock locks/mihomo/.python-version "${ctx_tmp}/lock/"
+
+          sudo -n podman build \
+            --pull=always \
+            --no-cache \
+            --build-context "setup=${ctx_tmp}/setup" \
+            --build-context "geodata=${ctx_tmp}/geodata" \
+            --build-context "lock=${ctx_tmp}/lock" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=https://github.com/Jerroro/ci-images" \
+            -t "${image}:sha-${GITHUB_SHA}" \
+            images/mihomo-ci
+
+          iid="$(sudo -n podman image inspect "${image}:sha-${GITHUB_SHA}" --format '{{.Id}}')"
+          [[ "$iid" == sha256:* ]] || iid="sha256:${iid}"
+
+          sudo -n podman run --rm --pull=never --network=none --read-only --cgroups=disabled \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777 \
+            --entrypoint /bin/bash "$iid" -euo pipefail -c '
+              test "$(id -u)" -eq 1001
+              test -x /home/runner/run.sh
+              test "${MIHOMO_CONFIG_VALIDATOR:-}" = "/usr/local/bin/mihomo"
+              test "${MIHOMO_SOPS_BIN:-}" = "/usr/local/bin/sops"
+              test "${MIHOMO_CONFIG_DATA_DIR:-}" = "/usr/share/mihomo-config/geodata"
+              test -s "${MIHOMO_CONFIG_DATA_DIR}/Country.mmdb"
+              GEODATA_MANIFEST=/usr/local/share/mihomo-ci/geodata.json /usr/local/libexec/mihomo-ci/provision.sh
+              test -s /usr/local/share/mihomo-ci/uv.lock.sha256
+              find /usr/local/share/mihomo-ci/wheelhouse -maxdepth 1 -type f -name "*.whl" | grep -q .
+              test -x /opt/mihomo-config/.venv/bin/python
+              /opt/mihomo-config/.venv/bin/python -c "import yaml, pytest, xdist"
+              /opt/mihomo-config/.venv/bin/ruff --version >/dev/null
+              test ! -e /tmp/mihomo-lock
+            '
+
+      - name: Push mihomo-ci to GHCR
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pkg="mihomo-ci"
+          image="ghcr.io/jerroro/${pkg}"
+          settings_url="https://github.com/users/Jerroro/packages/container/${pkg}/settings"
+          work_dir="$(mktemp -d)"
+          chmod 0700 "$work_dir"
+          trap 'sudo -n rm -rf "$work_dir"' EXIT
+          digest_file="${work_dir}/digest"
+
+          printf '%s' "$GH_TOKEN" | sudo -n podman login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          sudo -n podman push --digestfile "$digest_file" "${image}:sha-${GITHUB_SHA}"
+
+          manifest_digest="$(sudo -n cat "$digest_file" | tr -d '[:space:]')"
+          if [[ ! "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "ERROR: Unexpected pushed manifest digest: ${manifest_digest}" >&2
+            exit 1
+          fi
+
+          main_head="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [[ ! "$main_head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: Failed to resolve remote refs/heads/main SHA: ${main_head}" >&2
+            exit 1
+          fi
+          if [[ "$main_head" == "$GITHUB_SHA" ]]; then
+            sudo -n podman tag "${image}:sha-${GITHUB_SHA}" "${image}:latest"
+            sudo -n podman push "${image}:latest"
+          fi
+
+          echo "PUBLISHED_DIGEST=${image}@${manifest_digest}"
+          {
+            echo "### Published \`${image}\`"
+            echo "- Revision: \`${GITHUB_SHA}\`"
+            echo "- Immutable digest: \`${image}@${manifest_digest}\`"
+            echo "- Package settings: ${settings_url}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  agent-dev:
+    needs: [contracts]
+    if: needs.contracts.outputs.build_agent_dev == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Release unused hosted-runner SDK space and verify Podman
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo -n rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo -n apt-get update
+            sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              podman uidmap slirp4netns fuse-overlayfs
+          fi
+          sudo -n podman info --format 'Podman {{.Version.Version}} storage={{.Store.GraphDriverName}}'
+          df -h /
+
+      - name: Build, offline-smoke-test, and SSH-test agent-dev
+        run: |
+          set -euo pipefail
+          pkg="agent-dev"
+          image="ghcr.io/jerroro/${pkg}"
+
+          sudo -n podman build \
+            --pull=always \
+            --no-cache \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=https://github.com/Jerroro/ci-images" \
+            -t "${image}:sha-${GITHUB_SHA}" \
+            images/agent-dev
+
+          iid="$(sudo -n podman image inspect "${image}:sha-${GITHUB_SHA}" --format '{{.Id}}')"
+          [[ "$iid" == sha256:* ]] || iid="sha256:${iid}"
+
+          sudo -n podman run --rm --pull=never --network=none --read-only --cgroups=disabled \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777 \
+            --tmpfs /run:rw,nosuid,mode=0755 \
+            --entrypoint /usr/local/libexec/agent-container/smoke.sh "$iid"
+
+          sudo -n python3 images/agent-dev/test-ssh.py "$iid"
+
+      - name: Push agent-dev to GHCR
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pkg="agent-dev"
+          image="ghcr.io/jerroro/${pkg}"
+          settings_url="https://github.com/users/Jerroro/packages/container/${pkg}/settings"
+          work_dir="$(mktemp -d)"
+          chmod 0700 "$work_dir"
+          trap 'sudo -n rm -rf "$work_dir"' EXIT
+          digest_file="${work_dir}/digest"
+
+          printf '%s' "$GH_TOKEN" | sudo -n podman login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          sudo -n podman push --digestfile "$digest_file" "${image}:sha-${GITHUB_SHA}"
+
+          manifest_digest="$(sudo -n cat "$digest_file" | tr -d '[:space:]')"
+          if [[ ! "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "ERROR: Unexpected pushed manifest digest: ${manifest_digest}" >&2
+            exit 1
+          fi
+
+          main_head="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [[ ! "$main_head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: Failed to resolve remote refs/heads/main SHA: ${main_head}" >&2
+            exit 1
+          fi
+          if [[ "$main_head" == "$GITHUB_SHA" ]]; then
+            sudo -n podman tag "${image}:sha-${GITHUB_SHA}" "${image}:latest"
+            sudo -n podman push "${image}:latest"
+          fi
+
+          echo "PUBLISHED_DIGEST=${image}@${manifest_digest}"
+          {
+            echo "### Published \`${image}\`"
+            echo "- Revision: \`${GITHUB_SHA}\`"
+            echo "- Immutable digest: \`${image}@${manifest_digest}\`"
+            echo "- Package settings: ${settings_url}"
+          } >> "$GITHUB_STEP_SUMMARY"
