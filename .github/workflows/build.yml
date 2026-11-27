@@ -42,6 +42,53 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Install pinned linters (actionlint + hadolint)
+        run: |
+          set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          bin_dir="${RUNNER_TEMP}/linters"
+          mkdir -p "$bin_dir"
+
+          curl --retry 5 --retry-all-errors -fsSL \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            -o "${tmp_dir}/actionlint.tar.gz"
+          printf '%s  %s\n' \
+            "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8" \
+            "${tmp_dir}/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "${tmp_dir}/actionlint.tar.gz" -C "$tmp_dir" actionlint
+          printf '%s  %s\n' \
+            "c872d6db8c6bf83a8eaa704fc93999f027d55dffbc63b8a6abdccb47df5f4cd4" \
+            "${tmp_dir}/actionlint" | sha256sum -c -
+          install -m 0755 "${tmp_dir}/actionlint" "${bin_dir}/actionlint"
+
+          curl --retry 5 --retry-all-errors -fsSL \
+            https://github.com/hadolint/hadolint/releases/download/v2.14.0/hadolint-Linux-x86_64 \
+            -o "${tmp_dir}/hadolint"
+          printf '%s  %s\n' \
+            "6bf226944684f56c84dd014e8b979d27425c0148f61b3bd99bcc6f39e9dc5a47" \
+            "${tmp_dir}/hadolint" | sha256sum -c -
+          install -m 0755 "${tmp_dir}/hadolint" "${bin_dir}/hadolint"
+
+          printf '%s\n' "$bin_dir" >> "$GITHUB_PATH"
+
+      - name: Lint shell scripts, workflows, and Containerfiles
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          actionlint -version
+          hadolint --version
+          shellcheck \
+            images/infra-ci/provision.sh \
+            images/mihomo-ci/provision.sh \
+            images/agent-dev/build.sh \
+            images/agent-dev/scripts/*.sh
+          actionlint
+          hadolint --ignore DL3008 \
+            images/infra-ci/Containerfile \
+            images/mihomo-ci/Containerfile \
+            images/agent-dev/Containerfile
+
       - name: Run repository contract tests
         run: python3 -m unittest discover -s tests -v
 
@@ -196,6 +243,8 @@ jobs:
               test -x /home/runner/run.sh
               /usr/local/libexec/infra-ci/provision.sh --verify-only
               /usr/local/libexec/infra-ci/provision.sh
+              shellcheck --version
+              actionlint -version
               test -x /nix/var/nix/profiles/infra-ci/bin/nix
               test -L /nix/var/nix/gcroots/infra-ci-seed
               nix --version
@@ -307,6 +356,8 @@ jobs:
               test "${MIHOMO_CONFIG_DATA_DIR:-}" = "/usr/share/mihomo-config/geodata"
               test -s "${MIHOMO_CONFIG_DATA_DIR}/Country.mmdb"
               GEODATA_MANIFEST=/usr/local/share/mihomo-ci/geodata.json /usr/local/libexec/mihomo-ci/provision.sh
+              shellcheck --version
+              actionlint -version
               test -s /usr/local/share/mihomo-ci/uv.lock.sha256
               find /usr/local/share/mihomo-ci/wheelhouse -maxdepth 1 -type f -name "*.whl" | grep -q .
               test -x /opt/mihomo-config/.venv/bin/python

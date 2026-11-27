@@ -1,7 +1,10 @@
 FROM ghcr.io/actions/actions-runner:2.338.2@sha256:4037925f16bd0626196684aff1853dabd242675c82efe08f0a2d376694738d19 AS provisioned
 
+# hadolint ignore=DL3002
 USER root
+# hadolint ignore=DL3022
 COPY --from=setup provision.sh /usr/local/libexec/mihomo-ci/provision.sh
+# hadolint ignore=DL3022
 COPY --from=geodata geodata.json /usr/local/share/mihomo-ci/geodata.json
 RUN chown -R root:root /usr/local/libexec/mihomo-ci /usr/local/share/mihomo-ci \
     && chmod 0755 /usr/local/libexec/mihomo-ci/provision.sh \
@@ -14,6 +17,7 @@ RUN chown -R root:root /usr/local/libexec/mihomo-ci /usr/local/share/mihomo-ci \
 # lock metadata (pyproject.toml, uv.lock, .python-version) without leaking build inputs
 # or caches into the final runner image. Avoid Dockerfile heredocs for Buildah 1.33 parity.
 FROM provisioned AS wheelhouse-builder
+# hadolint ignore=DL3022
 COPY --from=lock pyproject.toml uv.lock .python-version /tmp/mihomo-lock/
 RUN set -eu; printf '%s\n' \
     'import hashlib, os, pathlib, subprocess, time, tomllib, urllib.parse, urllib.request' \
@@ -89,10 +93,11 @@ RUN set -eu; printf '%s\n' \
     'venv_dir.parent.mkdir(parents=True, exist_ok=True)' \
     'subprocess.run(["/usr/local/bin/uv", "venv", "--python", "/usr/local/bin/python3.14", str(venv_dir)], cwd=lock_dir, env=offline_env, check=True)' \
     'subprocess.run(["/usr/local/bin/uv", "pip", "sync", "--python", str(venv_dir / "bin/python"), "--offline", "--no-index", "--find-links", str(wheelhouse), "--require-hashes", str(req_path)], cwd=lock_dir, env=offline_env, check=True)' \
-    | SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt /usr/local/bin/python3.14 - \
+    > /tmp/build_wheelhouse.py \
+    && SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt /usr/local/bin/python3.14 /tmp/build_wheelhouse.py \
     && chown -R root:root /usr/local/share/mihomo-ci /opt/mihomo-config \
     && chmod -R a+rX /usr/local/share/mihomo-ci /opt/mihomo-config \
-    && rm -rf /tmp/mihomo-requirements.txt /tmp/uv-wheelhouse-cache /root/.cache
+    && rm -rf /tmp/build_wheelhouse.py /tmp/mihomo-requirements.txt /tmp/uv-wheelhouse-cache /root/.cache
 
 FROM provisioned
 COPY --from=wheelhouse-builder /usr/local/share/mihomo-ci /usr/local/share/mihomo-ci
@@ -105,7 +110,7 @@ ENV MIHOMO_CONFIG_VALIDATOR=/usr/local/bin/mihomo \
     UV_PYTHON_DOWNLOADS=never \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
-# Pre-bakes uv, Python 3.14, mihomo, sops, apt tools, SHA-256-verified Country.mmdb,
-# locked Python wheelhouse, and offline virtualenv from public lock metadata.
+# Pre-bakes uv, Python 3.14, mihomo, sops, shellcheck, actionlint, apt tools,
+# SHA-256-verified Country.mmdb, locked Python wheelhouse, and offline virtualenv.
 # No checkout, GitHub token, private subscription data, or runtime secrets belong here.
 USER runner

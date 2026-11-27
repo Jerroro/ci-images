@@ -20,6 +20,11 @@ SOPS_VERSION="v3.11.0"
 SOPS_URL="https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.linux.amd64"
 SOPS_BIN_SHA256="775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef"
 
+ACTIONLINT_VERSION="v1.7.12"
+ACTIONLINT_TAR_URL="https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz"
+ACTIONLINT_TAR_SHA256="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+ACTIONLINT_BIN_SHA256="c872d6db8c6bf83a8eaa704fc93999f027d55dffbc63b8a6abdccb47df5f4cd4"
+
 INSTALL_BIN_DIR="/usr/local/bin"
 GEODATA_DIR="/usr/share/mihomo-config/geodata"
 
@@ -66,6 +71,7 @@ command -v unshare >/dev/null 2>&1 || missing_pkgs+=(util-linux)
 command -v ip >/dev/null 2>&1 || missing_pkgs+=(iproute2)
 command -v gzip >/dev/null 2>&1 || missing_pkgs+=(gzip)
 command -v tar >/dev/null 2>&1 || missing_pkgs+=(tar)
+command -v shellcheck >/dev/null 2>&1 || missing_pkgs+=(shellcheck)
 
 if ((${#missing_pkgs[@]} > 0)); then
   apt_opts=(-o "Acquire::Retries=5" -o "Acquire::http::Pipeline-Depth=0")
@@ -162,6 +168,21 @@ if ! check_sha256 "${INSTALL_BIN_DIR}/sops" "$SOPS_BIN_SHA256"; then
   as_root install -D -m 0755 "$tmp_dir/sops" "${INSTALL_BIN_DIR}/sops"
 fi
 
+if ! check_sha256 "${INSTALL_BIN_DIR}/actionlint" "$ACTIONLINT_BIN_SHA256"; then
+  ensure_tmp
+  fetch_file "$ACTIONLINT_TAR_URL" "$tmp_dir/actionlint.tar.gz"
+  check_sha256 "$tmp_dir/actionlint.tar.gz" "$ACTIONLINT_TAR_SHA256" || {
+    echo "ERROR: actionlint archive SHA-256 mismatch" >&2
+    exit 1
+  }
+  tar -xzf "$tmp_dir/actionlint.tar.gz" -C "$tmp_dir" actionlint
+  check_sha256 "$tmp_dir/actionlint" "$ACTIONLINT_BIN_SHA256" || {
+    echo "ERROR: extracted actionlint binary SHA-256 mismatch" >&2
+    exit 1
+  }
+  as_root install -D -m 0755 "$tmp_dir/actionlint" "${INSTALL_BIN_DIR}/actionlint"
+fi
+
 if [[ "${SKIP_GEODATA:-0}" != "1" ]]; then
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   manifest="${GEODATA_MANIFEST:-}"
@@ -217,6 +238,9 @@ fi
 python3.14 -c 'import sys; assert sys.version_info[:2] == (3, 14)'
 "${INSTALL_BIN_DIR}/mihomo" -v >/dev/null
 "${INSTALL_BIN_DIR}/sops" --disable-version-check --version >/dev/null
+command -v shellcheck >/dev/null 2>&1
+shellcheck --version >/dev/null
+"${INSTALL_BIN_DIR}/actionlint" -version >/dev/null
 
 if [[ -n "${GITHUB_PATH:-}" ]]; then
   printf '%s\n' "$INSTALL_BIN_DIR" >> "$GITHUB_PATH"

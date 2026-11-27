@@ -29,7 +29,13 @@ printf 'Candidate: %s\nBuild record: %s\n' "$image" "$attempt"
 printf 'building\n' > "$attempt/status"
 printf '%s\n' "$install_policy" > "$attempt/install-layer-policy"
 printf 'Installation policy: %s (base manifests always refreshed)\n' "$install_policy"
-trap 'code=$?; if (( code != 0 )); then printf "failed (exit %s); no deployment attempted\n" "$code" > "$attempt/status"; fi' EXIT
+on_exit() {
+    local code=$?
+    if (( code != 0 )); then
+        printf 'failed (exit %s); no deployment attempted\n' "$code" > "$attempt/status"
+    fi
+}
+trap on_exit EXIT
 
 # Record all image inputs and host-side checks before starting the build.
 (cd "$context" && sha256sum Containerfile sshd_config .containerignore .dockerignore \
