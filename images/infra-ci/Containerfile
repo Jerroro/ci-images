@@ -3,7 +3,9 @@ FROM ghcr.io/actions/actions-runner:2.338.2@sha256:4037925f16bd0626196684aff1853
 ARG APT_MIRROR=""
 ARG NIX_SUBSTITUTERS="https://cache.nixos.org"
 USER root
+# hadolint ignore=DL3022
 COPY --from=setup provision.sh /usr/local/libexec/infra-ci/provision.sh
+# hadolint ignore=DL3022
 COPY --from=lock flake.lock /usr/local/share/infra-ci/flake.lock
 RUN set -eu; \
     chown -R root:root /usr/local/libexec/infra-ci /usr/local/share/infra-ci; \
@@ -55,6 +57,7 @@ ENV PATH="/nix/var/nix/profiles/infra-ci/bin:/usr/local/sbin:/usr/local/bin:/usr
     NIX_SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt" \
     SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
 
+# hadolint ignore=SC2016
 RUN set -eu; \
     NIX_VERSION="2.36.0"; \
     case "$(uname -s).$(uname -m)" in \
@@ -73,10 +76,14 @@ RUN set -eu; \
     curl --retry 5 --retry-all-errors -fsSL \
       "https://releases.nixos.org/nix/nix-${NIX_VERSION}/nix-${NIX_VERSION}-${nix_system}.tar.xz" \
       -o "$tarball"; \
-    printf '%s  %s\n' "$nix_sha256" "$tarball" | sha256sum -c -; \
+    printf '%s  %s\n' "$nix_sha256" "$tarball" > "$tmp_dir/nix.sha256"; \
+    sha256sum -c "$tmp_dir/nix.sha256"; \
     mkdir -p "$tmp_dir/unpack"; \
     tar -xJf "$tarball" -C "$tmp_dir/unpack"; \
-    install_script="$(ls "$tmp_dir"/unpack/nix-*/install | head -n 1)"; \
+    set -- "$tmp_dir"/unpack/nix-*/install; \
+    test "$#" -eq 1; \
+    install_script="$1"; \
+    test -x "$install_script"; \
     USER="runner" NIX_INSTALLER_NO_MODIFY_PROFILE=1 INVOKED_FROM_INSTALL_IN=1 "$install_script" --no-daemon; \
     profile_link=""; \
     if [ -e "$HOME/.nix-profile" ]; then \

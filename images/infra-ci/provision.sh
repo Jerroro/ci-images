@@ -43,6 +43,32 @@ python3_bin="${INFRA_CI_PYTHON3:-/usr/bin/python3}"
 ca_bundle="${INFRA_CI_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
 apparmor_userns_knob="${INFRA_CI_APPARMOR_USERNS_PATH:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}"
 
+ACTIONLINT_VERSION="1.7.12"
+case "$(uname -s).$(uname -m)" in
+  Linux.x86_64)
+    ACTIONLINT_ARCH="amd64"
+    ACTIONLINT_TAR_SHA256="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+    ACTIONLINT_BIN_SHA256="c872d6db8c6bf83a8eaa704fc93999f027d55dffbc63b8a6abdccb47df5f4cd4"
+    ;;
+  Linux.aarch64)
+    ACTIONLINT_ARCH="arm64"
+    ACTIONLINT_TAR_SHA256="325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6"
+    ACTIONLINT_BIN_SHA256="ac0323433c2853ec3fb978c611430c5b3dc5d43c58d1a1ec031b00ab572beb60"
+    ;;
+  *)
+    echo "ERROR: unsupported platform for actionlint: $(uname -s).$(uname -m)" >&2
+    exit 1
+    ;;
+esac
+ACTIONLINT_TAR_URL="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_${ACTIONLINT_ARCH}.tar.gz"
+ACTIONLINT_BIN="${INFRA_CI_ACTIONLINT_BIN:-/usr/local/bin/actionlint}"
+
+check_sha256() {
+  local file="$1" expected="$2"
+  [[ -f "$file" ]] || return 1
+  printf '%s  %s\n' "$expected" "$file" | sha256sum --status -c - 2>/dev/null
+}
+
 if ((!verify_only)); then
   if [[ "${RUNNER_ENVIRONMENT:-}" == "github-hosted" ]]; then
     if [[ -n "${GITHUB_ENV:-}" ]]; then
@@ -75,6 +101,7 @@ command -v jq >/dev/null 2>&1 || packages+=(jq)
 PATH="$PATH:/usr/sbin:/sbin" command -v nft >/dev/null 2>&1 || packages+=(nftables)
 PATH="$PATH:/usr/sbin:/sbin" command -v ip >/dev/null 2>&1 || packages+=(iproute2)
 (command -v unshare >/dev/null 2>&1 && command -v nsenter >/dev/null 2>&1) || packages+=(util-linux)
+shellcheck --version >/dev/null 2>&1 || packages+=(shellcheck)
 
 if ((${#packages[@]} > 0)); then
   if ((verify_only)); then
@@ -97,6 +124,24 @@ if ((${#packages[@]} > 0)); then
   fi
 fi
 
+if ! ([[ -x "$ACTIONLINT_BIN" ]] && check_sha256 "$ACTIONLINT_BIN" "$ACTIONLINT_BIN_SHA256"); then
+  if ((verify_only)); then
+    echo "Missing or mismatched actionlint binary: ${ACTIONLINT_BIN}" >&2
+    exit 1
+  fi
+  tmp_dir="$(mktemp -d)"
+  trap '[[ -n "${tmp_dir:-}" ]] && rm -rf "$tmp_dir"' EXIT
+  curl --fail --silent --show-error --location \
+    --retry 5 --retry-all-errors --connect-timeout 20 --max-time 180 \
+    --output "${tmp_dir}/actionlint.tar.gz" "$ACTIONLINT_TAR_URL"
+  printf '%s  %s\n' "$ACTIONLINT_TAR_SHA256" "${tmp_dir}/actionlint.tar.gz" | sha256sum -c - >/dev/null
+  tar -xzf "${tmp_dir}/actionlint.tar.gz" -C "$tmp_dir" actionlint
+  printf '%s  %s\n' "$ACTIONLINT_BIN_SHA256" "${tmp_dir}/actionlint" | sha256sum -c - >/dev/null
+  as_root install -D -m 0755 "${tmp_dir}/actionlint" "$ACTIONLINT_BIN"
+  rm -rf "$tmp_dir"
+  trap - EXIT
+fi
+
 [[ -s "$ca_bundle" ]]
 command -v curl >/dev/null 2>&1
 command -v git >/dev/null 2>&1
@@ -108,3 +153,7 @@ PATH="$PATH:/usr/sbin:/sbin" command -v nft >/dev/null 2>&1
 PATH="$PATH:/usr/sbin:/sbin" command -v ip >/dev/null 2>&1
 command -v unshare >/dev/null 2>&1
 command -v nsenter >/dev/null 2>&1
+command -v shellcheck >/dev/null 2>&1
+shellcheck --version >/dev/null
+[[ -x "$ACTIONLINT_BIN" ]] && check_sha256 "$ACTIONLINT_BIN" "$ACTIONLINT_BIN_SHA256"
+"$ACTIONLINT_BIN" -version >/dev/null

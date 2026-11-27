@@ -22,6 +22,7 @@ RUN npm install --global --prefix /opt/agent-tools --no-audit --no-fund \
 FROM ${PYTHON_IMAGE} AS python-toolchain
 # Project venvs stay separate. Preserve the original single-interpreter
 # linters/test tools; isolate package-manager dependencies in their own venv.
+# hadolint ignore=DL3013
 RUN python -m pip install --no-cache-dir --disable-pip-version-check \
         ruff black mypy isort pytest cpplint cmakelang \
     && python -m venv /opt/python-tools \
@@ -29,6 +30,7 @@ RUN python -m pip install --no-cache-dir --disable-pip-version-check \
         --no-cache-dir --disable-pip-version-check uv poetry pipx
 
 FROM ${GO_IMAGE} AS go-toolchain
+# hadolint ignore=DL3062
 RUN CGO_ENABLED=0 GOTOOLCHAIN=local GOBIN=/opt/go-tools/bin \
         go install -p=4 github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest \
     && go version -m /opt/go-tools/bin/golangci-lint > /opt/go-tools/build-info.txt \
