@@ -72,7 +72,7 @@ RUN apt-get update \
         libpng-dev libpq-dev libreadline-dev libsqlite3-dev libssl-dev \
         libuuid1 libxml2-dev libxslt1-dev libyaml-dev libzip-dev libzstd1 \
         nano nasm netcat-openbsd ninja-build openssh-server openssh-sftp-server \
-        pkg-config procps protobuf-compiler ripgrep rsync sqlite3 sudo swig \
+        pkg-config procps protobuf-compiler ripgrep rsync shellcheck sqlite3 sudo swig \
         tini tmux universal-ctags unzip wget xz-utils yasm zip zlib1g-dev \
         bind9-dnsutils \
     && rm -rf /var/lib/apt/lists/* \
@@ -102,6 +102,37 @@ RUN mkdir -p /tmp/antigravity-install \
     && HOME=/tmp/antigravity-install bash /tmp/antigravity-install/install.sh \
         --dir /opt/antigravity/bin \
     && rm -rf /tmp/antigravity-install
+
+# Pin standalone workflow and Containerfile linters by upstream archive/binary SHA-256.
+RUN set -eu; \
+    mkdir -p /tmp/linters; \
+    case "$(uname -m)" in \
+        x86_64) \
+            al_arch="amd64"; \
+            al_sha="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"; \
+            hl_asset="hadolint-Linux-x86_64"; \
+            hl_sha="6bf226944684f56c84dd014e8b979d27425c0148f61b3bd99bcc6f39e9dc5a47" ;; \
+        aarch64) \
+            al_arch="arm64"; \
+            al_sha="325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6"; \
+            hl_asset="hadolint-Linux-arm64"; \
+            hl_sha="331f1d3511b84a4f1e3d18d52fec284723e4019552f4f47b19322a53ce9a40ed" ;; \
+        *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl --retry 5 --retry-all-errors -fsSL \
+        "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_${al_arch}.tar.gz" \
+        -o /tmp/linters/actionlint.tar.gz; \
+    curl --retry 5 --retry-all-errors -fsSL \
+        "https://github.com/hadolint/hadolint/releases/download/v2.14.0/${hl_asset}" \
+        -o /tmp/linters/hadolint; \
+    printf '%s  %s\n%s  %s\n' \
+        "$al_sha" /tmp/linters/actionlint.tar.gz \
+        "$hl_sha" /tmp/linters/hadolint > /tmp/linters/SHA256SUMS; \
+    sha256sum -c /tmp/linters/SHA256SUMS; \
+    tar -xzf /tmp/linters/actionlint.tar.gz -C /tmp/linters actionlint; \
+    install -m 0755 /tmp/linters/actionlint /usr/local/bin/actionlint; \
+    install -m 0755 /tmp/linters/hadolint /usr/local/bin/hadolint; \
+    rm -rf /tmp/linters
 
 COPY scripts/ /usr/local/libexec/agent-container/
 COPY sshd_config /etc/ssh/sshd_config
