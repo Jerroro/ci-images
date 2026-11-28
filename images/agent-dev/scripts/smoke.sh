@@ -12,6 +12,9 @@ case "${1:-}" in
         rustc --version
         cargo --version
         uv --version
+        shellcheck --version >/dev/null
+        actionlint -version >/dev/null
+        hadolint --version >/dev/null
         codex --version
         opencode --version
         pi --version
